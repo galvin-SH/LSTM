@@ -15,6 +15,7 @@ const HIDDEN_SIZE: usize = 128;  // Reduced from 256 for faster training
 const LEARNING_RATE: f64 = 0.001;
 const NUM_EPOCHS: usize = 2;     // Reduced from 10 for quick test
 const BATCH_SIZE: usize = 16;    // Larger batch size for better parallelism
+const GRADIENT_ACCUMULATION_STEPS: usize = 8;  // Accumulate gradients over N batches before updating
 const MAX_TRAINING_CHARS: usize = 100_000;  // Limit training data for quick test
 
 // --- Model Definition ---
@@ -147,7 +148,9 @@ fn train(
     // CRITICAL FIX: The optimizer needs the VarMap to get all trainable variables.
     varmap: &VarMap,
 ) -> Result<()> {
-    println!("--- Starting Training (with Parallel Batch Processing) ---");
+    println!("--- Starting Training (with Gradient Accumulation & Parallel Processing) ---");
+    println!("Using {} threads for parallel processing", rayon::current_num_threads());
+    println!("Gradient accumulation steps: {}", GRADIENT_ACCUMULATION_STEPS);
     let total_len = data.dim(0)?;
     let num_batches = (total_len - 1) / (BATCH_SIZE * SEQ_LEN);
 
@@ -158,57 +161,80 @@ fn train(
 
     for epoch in 1..=NUM_EPOCHS {
         let initial_lstm_state: Option<LSTMState> = None;
+        let mut epoch_loss = 0.0;
 
-        // Collect batch indices to process in parallel
-        let batch_indices: Vec<usize> = (0..num_batches).collect();
+        // Process batches in chunks for gradient accumulation
+        // This reduces mutex contention by grouping optimizer updates
+        for chunk_start in (0..num_batches).step_by(GRADIENT_ACCUMULATION_STEPS) {
+            let chunk_end = (chunk_start + GRADIENT_ACCUMULATION_STEPS).min(num_batches);
+            let chunk_indices: Vec<usize> = (chunk_start..chunk_end).collect();
+            let actual_accumulation_steps = chunk_indices.len();
 
-        // Process batches in parallel and collect losses
-        let losses: Vec<Result<f64>> = batch_indices
-            .par_iter()
-            .map(|&batch_idx| {
-                // Calculate indices for the batch slice
-                let start_slice = batch_idx * BATCH_SIZE * SEQ_LEN;
+            // Process this chunk of batches in parallel (forward passes and loss computation)
+            let batch_data: Vec<Result<(f64, Tensor, Tensor)>> = chunk_indices
+                .par_iter()
+                .map(|&batch_idx| {
+                    // Calculate indices for the batch slice
+                    let start_slice = batch_idx * BATCH_SIZE * SEQ_LEN;
 
-                // To correctly handle sequence and batch dimensions:
-                // 1. Slice the entire data tensor to get the segment for this batch.
-                let chunk = data.narrow(0, start_slice, BATCH_SIZE * SEQ_LEN + 1)?;
+                    // To correctly handle sequence and batch dimensions:
+                    // 1. Slice the entire data tensor to get the segment for this batch.
+                    let chunk = data.narrow(0, start_slice, BATCH_SIZE * SEQ_LEN + 1)?;
 
-                // 2. Separate into input and target segments
-                let x_chunk = chunk.narrow(0, 0, BATCH_SIZE * SEQ_LEN)?;
-                let y_chunk = chunk.narrow(0, 1, BATCH_SIZE * SEQ_LEN)?;
+                    // 2. Separate into input and target segments
+                    let x_chunk = chunk.narrow(0, 0, BATCH_SIZE * SEQ_LEN)?;
+                    let y_chunk = chunk.narrow(0, 1, BATCH_SIZE * SEQ_LEN)?;
 
-                // 3. Reshape into (BATCH_SIZE, SEQ_LEN) for input
-                let x_batch = x_chunk.reshape((BATCH_SIZE, SEQ_LEN))?;
+                    // 3. Reshape into (BATCH_SIZE, SEQ_LEN) for input
+                    let x_batch = x_chunk.reshape((BATCH_SIZE, SEQ_LEN))?;
 
-                // 4. Targets are flattened for cross_entropy loss
-                // (BATCH_SIZE * SEQ_LEN)
-                let flat_targets = y_chunk.reshape(x_chunk.shape())?;
+                    // 4. Targets are flattened for cross_entropy loss
+                    // (BATCH_SIZE * SEQ_LEN)
+                    let flat_targets = y_chunk.reshape(x_chunk.shape())?;
 
-                // 5. Forward Pass
-                // The state is reset for each batch in this simplified setup.
-                let (logits, _next_state) = model.forward(&x_batch, initial_lstm_state.clone())?;
+                    // 5. Forward Pass
+                    // The state is reset for each batch in this simplified setup.
+                    let (logits, _next_state) = model.forward(&x_batch, initial_lstm_state.clone())?;
 
-                // 6. Loss calculation (Softmax + NLL)
-                let loss = loss::cross_entropy(&logits, &flat_targets)?;
+                    // 6. Loss calculation (Softmax + NLL)
+                    let loss = loss::cross_entropy(&logits, &flat_targets)?;
+                    let loss_value = loss.to_vec0::<f32>()? as f64;
 
-                // 7. Backpropagation and Optimizer step (thread-safe)
+                    // Return loss value and scaled loss tensor for accumulation
+                    Ok((loss_value, loss, flat_targets))
+                })
+                .collect();
+
+            // Sum the losses for averaging and perform single backward+optimization step
+            let mut accumulated_loss_value = 0.0;
+            let mut loss_tensors = Vec::new();
+
+            for result in batch_data {
+                let (loss_val, loss_tensor, _) = result?;
+                accumulated_loss_value += loss_val;
+                loss_tensors.push(loss_tensor);
+            }
+
+            epoch_loss += accumulated_loss_value;
+
+            // Average the losses across the accumulation window
+            if !loss_tensors.is_empty() {
+                let mut avg_loss = loss_tensors[0].clone();
+                for loss_tensor in &loss_tensors[1..] {
+                    avg_loss = (&avg_loss + loss_tensor)?;
+                }
+                avg_loss = (&avg_loss / actual_accumulation_steps as f64)?;
+
+                // Single backward+optimizer step for the chunk
+                // This is the only mutex lock per chunk (instead of per batch)
                 {
                     let mut opt = optimizer.lock().unwrap();
-                    opt.backward_step(&loss)?;
+                    opt.backward_step(&avg_loss)?;
                 }
-
-                let loss_value = loss.to_vec0::<f32>()? as f64;
-                Ok(loss_value)
-            })
-            .collect();
-
-        // Calculate average loss from all batches
-        let mut sum_loss = 0.0;
-        for loss_result in losses {
-            sum_loss += loss_result?;
+            }
         }
 
-        let avg_loss = sum_loss / num_batches as f64;
+        let avg_loss = epoch_loss / num_batches as f64;
         println!(
             "Epoch {}/{}: Average Loss = {:.4}",
             epoch, NUM_EPOCHS, avg_loss

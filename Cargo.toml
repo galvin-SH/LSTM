@@ -16,3 +16,4 @@ anyhow = "1.0.100"
 rand = "0.10.0-rc.0"
 # Parallel processing for faster training
 rayon = "1.10"
+num_cpus = "1.17.0"
