@@ -1,0 +1,16 @@
+[package]
+name = "LSTM"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+# Core Candle framework and numerical computation.
+# Corrected version to 0.9.1 and removed the invalid `std` feature flag.
+candle-core = { version = "0.9.1" }
+# Neural network modules (LSTM, Embedding, Linear, Optimizers)
+# Corrected version to 0.9.1 and removed the invalid `std` feature flag.
+candle-nn = { version = "0.9.1" }
+# Error handling
+anyhow = "1.0.100"
+# For simple random number generation (used in sampling)
+rand = "0.10.0-rc.0"
