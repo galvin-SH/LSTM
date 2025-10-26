@@ -1,18 +1,17 @@
 use anyhow::{Context, Result};
 // Add VarMap to imports for variable management
-use candle_core::{DType, Device, Error, IndexOp, Module, ModuleT, Tensor, Var};
-use candle_nn::{lstm, loss, ops, optim, Embedding, Linear, LSTM, VarBuilder, Optimizer, VarMap};
-use rand::seq::SliceRandom;
+use candle_core::{DType, Device, Error, Module, Tensor};
+use candle_nn::{lstm, loss, ops, optim, Embedding, Linear, LSTM, VarBuilder, Optimizer, VarMap, RNN};
+use candle_nn::rnn::LSTMState;
 use std::collections::{HashMap, HashSet};
 use rand::prelude::IndexedRandom;
 // --- Hyperparameters and Constants ---
 
-const SEQ_LEN: usize = 100;
+const SEQ_LEN: usize = 20;
 const HIDDEN_SIZE: usize = 256;
-const NUM_LAYERS: usize = 2;
 const LEARNING_RATE: f64 = 0.001;
 const NUM_EPOCHS: usize = 10;
-const BATCH_SIZE: usize = 32;
+const BATCH_SIZE: usize = 2;
 
 // --- Model Definition ---
 
@@ -22,7 +21,6 @@ struct Config {
     vocab_size: usize,
     embedding_size: usize,
     hidden_size: usize,
-    num_layers: usize,
 }
 
 /// The Character-level RNN model using LSTM.
@@ -44,15 +42,12 @@ impl LstmModel {
         )?;
 
         // 2. LSTM layer: The core recurrent unit.
-        let lstm_cfg = candle_nn::rnn::LSTMConfig {
-            num_layers: config.num_layers,
-            // Candle's LSTM expects batch_first=true by default for simplicity.
-            ..Default::default()
-        };
+        // Note: candle-nn's LSTM creates a single layer. For multi-layer support,
+        // you would need to stack multiple LSTM instances manually.
         let lstm = lstm(
             config.embedding_size,
             config.hidden_size,
-            lstm_cfg,
+            Default::default(), // Use default LSTM configuration
             vs.pp("lstm"),
         )?;
 
@@ -74,13 +69,27 @@ impl LstmModel {
     /// Performs the forward pass.
     /// The input tensor has shape (BATCH_SIZE, SEQ_LEN).
     /// The output is the logits tensor of shape (BATCH_SIZE * SEQ_LEN, VOCAB_SIZE).
-    fn forward(&self, xs: &Tensor, state: Option<LSTMState>) -> Result<(Tensor, LSTMState)> {
+    fn forward(&self, xs: &Tensor, _state: Option<LSTMState>) -> Result<(Tensor, LSTMState)> {
         // 1. Get embeddings: (BATCH_SIZE, SEQ_LEN) -> (BATCH_SIZE, SEQ_LEN, EMBEDDING_SIZE)
         let embedded = self.embedding.forward(xs)?;
 
-        // 2. Pass through LSTM. Output is (BATCH_SIZE, SEQ_LEN, HIDDEN_SIZE)
-        // Use forward_t as it handles training/inference modes if specified in LSTMConfig (not needed here)
-        let (lstm_out, new_state) = self.lstm.forward_t(&embedded, state)?;
+        // 2. Pass through LSTM. The seq() method returns Vec<(hidden, cell)> for each timestep
+        let states = self.lstm.seq(&embedded)?;
+
+        // Extract hidden states from each timestep and stack them
+        // LSTMState has h() method to get hidden state
+        let hidden_states: Vec<Tensor> = states.iter().map(|state| state.h().clone()).collect();
+
+        // Stack hidden states: Vec<Tensor> -> (SEQ_LEN, BATCH_SIZE, HIDDEN_SIZE)
+        let lstm_out = Tensor::stack(&hidden_states, 0)?;
+
+        // Transpose to (BATCH_SIZE, SEQ_LEN, HIDDEN_SIZE)
+        let lstm_out = lstm_out.transpose(0, 1)?;
+
+        // Get the final state (last element in states vec)
+        let final_state = states.last()
+            .ok_or_else(|| Error::Msg("No LSTM states returned".to_string()))?
+            .clone();
 
         // 3. Reshape for linear layer: (BATCH_SIZE * SEQ_LEN, HIDDEN_SIZE)
         let batch_size = xs.dim(0)?;
@@ -90,12 +99,9 @@ impl LstmModel {
         // 4. Final linear layer: (BATCH_SIZE * SEQ_LEN, VOCAB_SIZE)
         let logits = self.output_linear.forward(&reshaped_out)?;
 
-        Ok((logits, new_state))
+        Ok((logits, final_state))
     }
 }
-
-// Custom type alias for LSTM state (Hidden and Cell state)
-type LSTMState = (Tensor, Tensor);
 
 // --- Data & Vocabulary Processing ---
 
@@ -132,31 +138,26 @@ fn prepare_data(text: &str, device: &Device) -> Result<(Tensor, HashMap<char, us
 fn train(
     model: &LstmModel,
     data: &Tensor,
-    vocab_size: usize,
-    device: &Device,
+    _vocab_size: usize,
+    _device: &Device,
     // CRITICAL FIX: The optimizer needs the VarMap to get all trainable variables.
     varmap: &VarMap,
 ) -> Result<()> {
     println!("--- Starting Training ---");
     let total_len = data.dim(0)?;
-    let num_batches = (total_len - SEQ_LEN) / BATCH_SIZE;
+    let num_batches = (total_len - 1) / (BATCH_SIZE * SEQ_LEN);
 
     // Use AdamW for optimization (a common choice for RNNs/Transformers)
-    let params = optim::AdamW::default();
-
-    // CRITICAL FIX: Get all variables from the VarMap for the optimizer.
-    let mut optimizer = optim::AdamW::new(varmap.all_vars(), params)?;
+    // Get all variables from the VarMap for the optimizer.
+    let mut optimizer = optim::AdamW::new_lr(varmap.all_vars(), LEARNING_RATE)?;
 
     for epoch in 1..=NUM_EPOCHS {
         let mut sum_loss = 0.0;
-        let mut initial_lstm_state: Option<LSTMState> = None;
+        let initial_lstm_state: Option<LSTMState> = None;
 
         for batch_idx in 0..num_batches {
-            let start = batch_idx * BATCH_SIZE;
-
             // Calculate indices for the batch slice
-            let start_slice = start * SEQ_LEN;
-            let end_slice = start_slice + BATCH_SIZE * SEQ_LEN;
+            let start_slice = batch_idx * BATCH_SIZE * SEQ_LEN;
 
             // To correctly handle sequence and batch dimensions:
             // 1. Slice the entire data tensor to get the segment for this batch.
@@ -251,7 +252,7 @@ fn sample(
         let probabilities_vec = probabilities.to_vec2::<f32>()?[0].clone();
 
         // Sample the next character index
-        let mut rng = rand::thread_rng();
+        let mut rng = rand::rng();
         let next_idx = probabilities_vec
             .iter()
             .enumerate()
@@ -285,7 +286,6 @@ fn run() -> Result<()> {
         vocab_size: idx_to_char.len(),
         embedding_size: 128,
         hidden_size: HIDDEN_SIZE,
-        num_layers: NUM_LAYERS,
     };
 
     // 2. Initialize Model and Optimizer
