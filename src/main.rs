@@ -4,14 +4,18 @@ use candle_core::{DType, Device, Error, Module, Tensor};
 use candle_nn::{lstm, loss, ops, optim, Embedding, Linear, LSTM, VarBuilder, Optimizer, VarMap, RNN};
 use candle_nn::rnn::LSTMState;
 use std::collections::{HashMap, HashSet};
+use std::fs;
+use std::sync::{Arc, Mutex};
 use rand::prelude::IndexedRandom;
+use rayon::prelude::*;
 // --- Hyperparameters and Constants ---
 
 const SEQ_LEN: usize = 20;
-const HIDDEN_SIZE: usize = 256;
+const HIDDEN_SIZE: usize = 128;  // Reduced from 256 for faster training
 const LEARNING_RATE: f64 = 0.001;
-const NUM_EPOCHS: usize = 10;
-const BATCH_SIZE: usize = 2;
+const NUM_EPOCHS: usize = 2;     // Reduced from 10 for quick test
+const BATCH_SIZE: usize = 16;    // Larger batch size for better parallelism
+const MAX_TRAINING_CHARS: usize = 100_000;  // Limit training data for quick test
 
 // --- Model Definition ---
 
@@ -143,49 +147,65 @@ fn train(
     // CRITICAL FIX: The optimizer needs the VarMap to get all trainable variables.
     varmap: &VarMap,
 ) -> Result<()> {
-    println!("--- Starting Training ---");
+    println!("--- Starting Training (with Parallel Batch Processing) ---");
     let total_len = data.dim(0)?;
     let num_batches = (total_len - 1) / (BATCH_SIZE * SEQ_LEN);
 
     // Use AdamW for optimization (a common choice for RNNs/Transformers)
     // Get all variables from the VarMap for the optimizer.
-    let mut optimizer = optim::AdamW::new_lr(varmap.all_vars(), LEARNING_RATE)?;
+    // Wrap optimizer in Arc<Mutex<>> for thread-safe access
+    let optimizer = Arc::new(Mutex::new(optim::AdamW::new_lr(varmap.all_vars(), LEARNING_RATE)?));
 
     for epoch in 1..=NUM_EPOCHS {
-        let mut sum_loss = 0.0;
         let initial_lstm_state: Option<LSTMState> = None;
 
-        for batch_idx in 0..num_batches {
-            // Calculate indices for the batch slice
-            let start_slice = batch_idx * BATCH_SIZE * SEQ_LEN;
+        // Collect batch indices to process in parallel
+        let batch_indices: Vec<usize> = (0..num_batches).collect();
 
-            // To correctly handle sequence and batch dimensions:
-            // 1. Slice the entire data tensor to get the segment for this batch.
-            let chunk = data.narrow(0, start_slice, BATCH_SIZE * SEQ_LEN + 1)?;
+        // Process batches in parallel and collect losses
+        let losses: Vec<Result<f64>> = batch_indices
+            .par_iter()
+            .map(|&batch_idx| {
+                // Calculate indices for the batch slice
+                let start_slice = batch_idx * BATCH_SIZE * SEQ_LEN;
 
-            // 2. Separate into input and target segments
-            let x_chunk = chunk.narrow(0, 0, BATCH_SIZE * SEQ_LEN)?;
-            let y_chunk = chunk.narrow(0, 1, BATCH_SIZE * SEQ_LEN)?;
+                // To correctly handle sequence and batch dimensions:
+                // 1. Slice the entire data tensor to get the segment for this batch.
+                let chunk = data.narrow(0, start_slice, BATCH_SIZE * SEQ_LEN + 1)?;
 
-            // 3. Reshape into (BATCH_SIZE, SEQ_LEN) for input
-            let x_batch = x_chunk.reshape((BATCH_SIZE, SEQ_LEN))?;
+                // 2. Separate into input and target segments
+                let x_chunk = chunk.narrow(0, 0, BATCH_SIZE * SEQ_LEN)?;
+                let y_chunk = chunk.narrow(0, 1, BATCH_SIZE * SEQ_LEN)?;
 
-            // 4. Targets are flattened for cross_entropy loss
-            // (BATCH_SIZE * SEQ_LEN)
-            let flat_targets = y_chunk.reshape(x_chunk.shape())?;
+                // 3. Reshape into (BATCH_SIZE, SEQ_LEN) for input
+                let x_batch = x_chunk.reshape((BATCH_SIZE, SEQ_LEN))?;
 
-            // 5. Forward Pass
-            // The state is reset for each batch in this simplified setup.
-            let (logits, _next_state) = model.forward(&x_batch, initial_lstm_state.clone())?;
-            // Note: If you want continuous training across batches, uncomment the line below:
-            // initial_lstm_state = Some(next_state);
+                // 4. Targets are flattened for cross_entropy loss
+                // (BATCH_SIZE * SEQ_LEN)
+                let flat_targets = y_chunk.reshape(x_chunk.shape())?;
 
-            // 6. Loss calculation (Softmax + NLL)
-            let loss = loss::cross_entropy(&logits, &flat_targets)?;
+                // 5. Forward Pass
+                // The state is reset for each batch in this simplified setup.
+                let (logits, _next_state) = model.forward(&x_batch, initial_lstm_state.clone())?;
 
-            // 7. Backpropagation and Optimizer step
-            optimizer.backward_step(&loss)?;
-            sum_loss += loss.to_vec0::<f32>()? as f64;
+                // 6. Loss calculation (Softmax + NLL)
+                let loss = loss::cross_entropy(&logits, &flat_targets)?;
+
+                // 7. Backpropagation and Optimizer step (thread-safe)
+                {
+                    let mut opt = optimizer.lock().unwrap();
+                    opt.backward_step(&loss)?;
+                }
+
+                let loss_value = loss.to_vec0::<f32>()? as f64;
+                Ok(loss_value)
+            })
+            .collect();
+
+        // Calculate average loss from all batches
+        let mut sum_loss = 0.0;
+        for loss_result in losses {
+            sum_loss += loss_result?;
         }
 
         let avg_loss = sum_loss / num_batches as f64;
@@ -272,15 +292,27 @@ fn sample(
 }
 
 fn run() -> Result<()> {
-    // We use the CPU device for this example, as it is always available.
-    let device = Device::Cpu;
+    // Try to use CUDA if available, otherwise fall back to CPU
+    let device = Device::cuda_if_available(0)?;
+    println!("Using device: {:?}", device);
 
-    // A small sample text for training
-    let raw_text = "The only thing necessary for the triumph of evil is for good men to do nothing. All that glitters is not gold. A journey of a thousand miles begins with a single step. To be or not to be, that is the question.";
+    // Load training text from the data directory
+    let raw_text = fs::read_to_string("data/input.txt")
+        .context("Failed to read training data from data/input.txt")?;
+
+    println!("Loaded {} characters from data/input.txt", raw_text.len());
+
+    // Limit training data for faster test runs
+    let training_text = if raw_text.len() > MAX_TRAINING_CHARS {
+        println!("Limiting training data to {} characters for quick test", MAX_TRAINING_CHARS);
+        &raw_text[..MAX_TRAINING_CHARS]
+    } else {
+        &raw_text
+    };
 
     // 1. Prepare Data and Vocabulary
     let (data_tensor, char_to_idx, idx_to_char) =
-        prepare_data(raw_text.to_lowercase().as_str(), &device)?;
+        prepare_data(training_text.to_lowercase().as_str(), &device)?;
 
     let config = Config {
         vocab_size: idx_to_char.len(),
